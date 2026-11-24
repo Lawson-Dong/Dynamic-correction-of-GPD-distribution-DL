@@ -5,20 +5,23 @@ Two-stage tail model: the ONLY inference implementation (forward pass + risk mea
     Stage 1  p_u(x) = P(L > u | x)                         artifacts/pu_model.pt
     Stage 2  S(y|x) = (1-pi) S_GPD(y; xi_b, beta_b) + pi S_GPD(y; xi_h, beta_h)   artifacts/gpd_model.pt
 
-Used by the training script (risk measures, backtest, numpy-vs-torch check), evaluate_tail.py,
-gpd_predict.py, quantconnect/export_model_for_qc.py, quantconnect/main.py and the notebook.
-Only numpy (pandas optional). Reads the PyTorch .pt files directly -- torch is not needed --
-or the JSON written by to_json() (QuantConnect). Preprocessing and BatchNorm are exactly the
-training-time inference path (training statistics, BN moving statistics).
+Used by evaluate_tail.py, gpd_predict.py, quantconnect/ and the notebook. Only numpy (pandas
+optional), no torch. Models are versioned JSON files in models/ (weights + preprocessing +
+an "info" block: version, description, configuration, data, validation results);
+models/LATEST names the current one. Preprocessing and BatchNorm follow the training-time
+inference path exactly (training statistics, BN moving statistics).
 
     from tail_model import TwoStageTailModel
-    m = TwoStageTailModel.from_artifacts("artifacts")     # or .from_json(text_or_dict)
+    m = TwoStageTailModel.load()                          # models/LATEST (or a path / directory)
+    m.version, m.info                                     # which model, how it was trained, results
     m.predict(df)              # xi_b, beta_b, xi_h, beta_h, pi, p_u   (df = 13 RAW factors)
     m.tail_prob(df, 0.10)      # P(next-day loss > 10%)
     m.var(df, 0.01), m.es(df, 0.01)
     m.risk_score(df, d=0.07)   # E[(L-d)^+] = p_u * E[(L-d)^+ | L > u]
 
-CLI: python tail_model.py --selftest | --csv factors.csv --out predictions.csv
+CLI: python tail_model.py --selftest | --csv factors.csv --out predictions.csv [--model PATH]
+     python tail_model.py --export-artifacts DIR --version NAME --description TEXT
+                          (PyTorch artifacts -> new models/NAME.json, set as LATEST)
 Losses are positive numbers (0.07 = 7% drop); y = L - u is the excess loss.
 """
 from __future__ import annotations
@@ -39,6 +42,7 @@ except ImportError:
 
 PARAM_COLS = ["xi_b", "beta_b", "xi_h", "beta_h", "pi"]
 JSON_FORMAT = "gpd_mixture_numpy_v1"
+MODELS_DIR = Path(__file__).resolve().parent / "models"
 
 
 # =============================================================================
@@ -239,8 +243,9 @@ def var99_by_decile(p_u, params, L, u, n_bins=10, constant_p_u=0.10):
 class TwoStageTailModel:
     """Both networks + preprocessing. Attributes: feature_names, u, scale, pi_min, meta."""
 
-    def __init__(self, gpd_weights, pu_weights, meta, pu_bn_eps=None):
-        self.meta = meta
+    def __init__(self, gpd_weights, pu_weights, meta, pu_bn_eps=None, info=None):
+        self.info = dict(info or {})
+        self.meta = {**self.info, **meta}          # inference fields + descriptive info
         self.feature_names = list(meta["feature_names"])
         self.u = float(meta["threshold_u_loss"])
         self.pi_min = float(meta["pi_min"])
@@ -262,17 +267,39 @@ class TwoStageTailModel:
     def has_pu(self):
         return self.p is not None
 
+    @property
+    def version(self):
+        return self.info.get("version", "unversioned")
+
     # ---------------------------------------------------------------- loading / saving
     @classmethod
+    def load(cls, path=None):
+        """A model version: a JSON file, or a directory whose LATEST file names one (default models/)."""
+        p = Path(path) if path is not None else MODELS_DIR
+        if p.is_dir():
+            latest = p / "LATEST"
+            if not latest.exists():
+                raise FileNotFoundError(f"{latest} not found")
+            p = p / latest.read_text().strip()
+        return cls.from_json(p)
+
+    @classmethod
     def from_artifacts(cls, artifact_dir="artifacts", require_pu=True):
-        """preprocess.json + gpd_model.pt (+ pu_model.pt) from one folder."""
+        """PyTorch training artifacts (preprocess.json, gpd_model.pt, pu_model.pt [, pu_meta.json])."""
         d = Path(artifact_dir)
         meta = json.loads((d / "preprocess.json").read_text())
         gpd = load_state_dict(d / meta.get("model_file", "gpd_model.pt"))
         pu_path = d / "pu_model.pt"
         if not pu_path.exists() and require_pu:
             raise FileNotFoundError(f"{pu_path} not found (stage 1 network)")
-        return cls(gpd, load_state_dict(pu_path) if pu_path.exists() else None, meta)
+        drop = {"loss_history", "early_stop_nll_history", "early_stop_logloss_history", "tickers"}
+        info = {k: v for k, v in meta.items() if k not in drop}
+        info["n_tickers"] = len(meta.get("tickers", []))
+        if (d / "pu_meta.json").exists():
+            pm = json.loads((d / "pu_meta.json").read_text())
+            info["p_u"] = {k: v for k, v in pm.items() if k not in drop}
+        pu = load_state_dict(pu_path) if pu_path.exists() else None
+        return cls(gpd, pu, meta, info=info)
 
     def to_dict(self):
         """Plain-JSON model (weights + preprocessing), format gpd_mixture_numpy_v1."""
@@ -281,6 +308,7 @@ class TwoStageTailModel:
                         "feature_median_fill": self.median.tolist(), "feature_mean": self.mean.tolist(),
                         "feature_std": self.std.tolist(), "clip_z": self.clip_z,
                         "threshold_u_loss": self.u, "pi_min": self.pi_min, "bn_eps": self.bn_eps},
+               "info": self.info,
                "weights": {k: v.tolist() for k, v in self.g.items()}}
         if self.has_pu:
             out["pu"] = {"bn_eps": self.pu_bn_eps, "weights": {k: v.tolist() for k, v in self.p.items()}}
@@ -304,7 +332,21 @@ class TwoStageTailModel:
             raise ValueError(f"not a {JSON_FORMAT} model file")
         pu = obj.get("pu")
         return cls(obj["weights"], pu["weights"] if pu else None, obj["meta"],
-                   pu_bn_eps=pu.get("bn_eps") if pu else None)
+                   pu_bn_eps=pu.get("bn_eps") if pu else None, info=obj.get("info"))
+
+    def save_version(self, version, description="", models_dir=None, set_latest=True, **extra_info):
+        """Write models/<version>.json (weights + preprocessing + info) and point models/LATEST to it."""
+        from datetime import datetime
+        d = Path(models_dir) if models_dir is not None else MODELS_DIR
+        d.mkdir(parents=True, exist_ok=True)
+        self.info.update(extra_info, version=version, description=description,
+                         created_at=datetime.now().isoformat(timespec="seconds"))
+        self.meta.update(self.info)
+        path = d / f"{version}.json"
+        self.to_json(path)
+        if set_latest:
+            (d / "LATEST").write_text(path.name + "\n")
+        return path
 
     # ---------------------------------------------------------------- inputs
     def to_matrix(self, X):
@@ -443,20 +485,32 @@ def _selftest(m):
         v = m.var(X, 0.01)
         ok = np.isfinite(v)
         assert np.allclose(m.tail_prob(X[ok], v[ok]), 0.01, rtol=1e-4) and (m.es(X[ok], 0.01) > v[ok]).all()
-    print(f"self-test passed: u = {m.u:.4f}, pi_min = {m.pi_min}, xi_h = {P[0, 2]:.3f}, "
+    print(f"self-test passed [{m.version}]: u = {m.u:.4f}, pi_min = {m.pi_min}, xi_h = {P[0, 2]:.3f}, "
           f"beta_h = {P[0, 3]:.4f}, p_u network: {m.has_pu}")
 
 
 def main():
     ap = argparse.ArgumentParser(description="Two-stage tail model: forward pass and risk measures")
-    ap.add_argument("--artifacts", default=str(Path(__file__).resolve().parent / "artifacts"))
+    ap.add_argument("--model", default=None, help="model JSON or directory (default: models/LATEST)")
+    ap.add_argument("--export-artifacts", default=None, help="PyTorch artifacts folder to turn into a new version")
+    ap.add_argument("--version", default=None, help="name of the new version (with --export-artifacts)")
+    ap.add_argument("--description", default="", help="one-line description of the new version")
     ap.add_argument("--csv", help="CSV with the 13 raw factor columns (other columns are kept)")
     ap.add_argument("--out", help="output CSV (default: print the first rows)")
     ap.add_argument("--d", type=float, default=0.07, help="disaster loss for the risk score")
     ap.add_argument("--alpha", type=float, default=0.01, help="VaR / ES level (0.01 -> 99%%)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
-    m = TwoStageTailModel.from_artifacts(args.artifacts)
+    if args.export_artifacts:
+        if not args.version:
+            raise SystemExit("--version is required with --export-artifacts")
+        m = TwoStageTailModel.from_artifacts(args.export_artifacts)
+        path = m.save_version(args.version, args.description,
+                              models_dir=args.model if args.model else None)
+        _selftest(TwoStageTailModel.load(path))
+        print(f"wrote {path} and set it as LATEST")
+        return
+    m = TwoStageTailModel.load(args.model)
     if args.selftest or not args.csv:
         _selftest(m)
         if not args.csv:

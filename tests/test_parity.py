@@ -5,12 +5,11 @@ Run:  python tests/test_parity.py        (or: python -m pytest tests/)
 
 1. factor_core reproduces the factor formulas the dataset was built with (frozen reference
    copies below) -- price factors, target, history factors, the live panel used by QuantConnect.
-2. tail_model: JSON round trip is exact; if artifacts/dataset.csv exists, the validation
-   metrics logged by training (preprocess.json, pu_meta.json) are reproduced.
-3. If torch is installed: tail_model matches the PyTorch networks of the training script.
+2. tail_model: every model version in models/ loads and round-trips exactly through JSON;
+   LATEST points to an existing file; if artifacts/dataset.csv exists, the validation metrics
+   stored in the latest version's info block are reproduced.
+3. strategy_core: allocation rule.
 """
-import importlib.util
-import json
 import sys
 from pathlib import Path
 
@@ -23,7 +22,8 @@ import factor_core as fc      # noqa: E402
 import strategy_core as sc    # noqa: E402
 import tail_model as tm       # noqa: E402
 
-ART = ROOT / "artifacts"
+ART = ROOT / "artifacts"          # dataset.csv
+MODELS = ROOT / "models"
 
 
 # ---------------------------------------------------------------- frozen reference formulas
@@ -132,75 +132,52 @@ def test_live_panel_matches_training_formulas():
 
 # ---------------------------------------------------------------- 2. model
 def _model():
-    if not (ART / "gpd_model.pt").exists():
+    if not (MODELS / "LATEST").exists():
         return None
-    return tm.TwoStageTailModel.from_artifacts(ART, require_pu=False)
+    return tm.TwoStageTailModel.load(MODELS)
 
 
-def test_json_round_trip():
-    m = _model()
-    if m is None:
-        print("  (no artifacts: skipped)")
+def test_model_versions_load_and_round_trip():
+    if not MODELS.exists():
+        print("  (no models/: skipped)")
         return
+    latest = (MODELS / "LATEST").read_text().strip()
+    assert (MODELS / latest).exists(), f"models/LATEST names a missing file: {latest}"
     rng = np.random.default_rng(3)
-    X = m.mean + m.std * rng.normal(scale=2, size=(2000, len(m.mean)))
-    X[rng.random(X.shape) < 0.05] = np.nan
-    back = tm.TwoStageTailModel.from_json(m.to_json())
-    assert np.array_equal(back.gpd_params(X), m.gpd_params(X))
-    if m.has_pu:
-        assert np.array_equal(back.exceedance_prob(X), m.exceedance_prob(X))
-    qc_json = ROOT / "quantconnect" / "gpd_mixture_model.json"
-    if qc_json.exists():
-        q = tm.TwoStageTailModel.from_json(qc_json)
-        assert np.allclose(q.gpd_params(X), m.gpd_params(X), rtol=1e-12, atol=0), \
-            "quantconnect/gpd_mixture_model.json is not the model in artifacts/ -- re-export it"
+    for path in sorted(MODELS.glob("*.json")):
+        m = tm.TwoStageTailModel.load(path)
+        assert m.version == path.stem, f"{path.name}: info.version is {m.version!r}"
+        assert m.feature_names == fc.FEATURE_NAMES, f"{path.name}: feature order differs from factor_core"
+        X = m.mean + m.std * rng.normal(scale=2, size=(2000, len(m.mean)))
+        X[rng.random(X.shape) < 0.05] = np.nan
+        back = tm.TwoStageTailModel.from_json(m.to_json())
+        assert np.array_equal(back.gpd_params(X), m.gpd_params(X))
+        if m.has_pu:
+            assert np.array_equal(back.exceedance_prob(X), m.exceedance_prob(X))
 
 
-def test_reproduces_logged_validation_metrics():
+def test_reproduces_stored_validation_metrics():
     m = _model()
-    if m is None or not (ART / "dataset.csv").exists():
-        print("  (no artifacts/dataset.csv: skipped)")
+    if m is None or not (ART / "dataset.csv").exists() or "results" not in m.info:
+        print("  (no artifacts/dataset.csv or no stored results: skipped)")
         return
     df = pd.read_csv(ART / "dataset.csv", parse_dates=["date"])
-    val = df[df["date"] >= pd.Timestamp(m.meta["train_val_split_date"])]
+    val = df[df["date"] >= pd.Timestamp(m.info["train_val_split_date"])]
     L = -val["Y"].to_numpy()
     exc = L > m.u
     P = m.gpd_params(val[exc])
     y = L[exc] - m.u
-    rec = m.meta["results"]["validation"]
+    rec = m.info["results"]["validation"]
     assert abs(-tm.mixture_logpdf(P, y).mean() - rec["nll"]) < 1e-4
     S = tm.mixture_survival(P, y)
     for a, v in rec["observed_share_S_below"].items():
         assert abs(np.mean(S < float(a)) - v) < 1e-6, f"S<{a}"
-    if m.has_pu and (ART / "pu_meta.json").exists():
-        pr = json.loads((ART / "pu_meta.json").read_text())["results"]["validation"]
+    if m.has_pu and "p_u" in m.info:
+        pr = m.info["p_u"]["results"]["validation"]
         p = m.exceedance_prob(val)
         e = exc.astype(float)
         ll = -np.mean(e * np.log(np.clip(p, 1e-7, 1)) + (1 - e) * np.log(np.clip(1 - p, 1e-7, 1)))
         assert abs(ll - pr["logloss"]) < 1e-5 and abs(tm.auc_score(p, e) - pr["auc"]) < 1e-6
-
-
-def test_matches_torch_networks():
-    m = _model()
-    try:
-        import torch
-    except ImportError:
-        print("  (torch not installed: skipped)")
-        return
-    if m is None:
-        return
-    spec = importlib.util.spec_from_file_location("tr", ROOT / "TQT research machine learning part.py")
-    tr = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(tr)
-    rng = np.random.default_rng(4)
-    z = rng.normal(size=(3000, len(m.mean))).clip(-5, 5)
-    x = torch.from_numpy(z.astype("float32"))
-    with torch.no_grad():
-        P_t = tr.load_gpd_model(ART / "gpd_model.pt", m.scale, m.pi_min)(x).double().numpy()
-    assert np.max(np.abs(m.gpd_params_z(z) - P_t) / np.maximum(np.abs(P_t), 1e-12)) < 1e-4
-    if m.has_pu:
-        p_t = tr.load_pu_model(ART / "pu_model.pt").predict_proba(x).double().numpy()
-        assert np.max(np.abs(m.exceedance_prob_z(z) - p_t) / p_t) < 1e-4
 
 
 # ---------------------------------------------------------------- 3. allocation

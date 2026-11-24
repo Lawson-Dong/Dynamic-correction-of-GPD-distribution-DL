@@ -6,7 +6,7 @@ This file keeps the old GPDPredictor API and command line on top of it (no torch
 
 Python use:
     from gpd_predict import GPDPredictor
-    p = GPDPredictor()                         # loads artifacts/ (both stages)
+    p = GPDPredictor()                         # loads models/LATEST (both stages)
     params = p.predict(df)                     # df has the 13 factor columns (raw, unscaled)
     p.survival(params, loss=0.10)              # P(loss > 10% | loss > u)
     p.quantile(params, 0.99)                   # 99% quantile of the LOSS given loss > u
@@ -27,14 +27,15 @@ import pandas as pd
 import tail_model
 from tail_model import PARAM_COLS
 
-ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts"
+ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts"     # dataset.csv
 
 
 class GPDPredictor:
     """Thin wrapper around tail_model.TwoStageTailModel with the old method names."""
 
-    def __init__(self, artifact_dir=ARTIFACT_DIR):
-        self.model = tail_model.TwoStageTailModel.from_artifacts(artifact_dir, require_pu=False)
+    def __init__(self, model_path=None):
+        """model_path: model JSON or directory; default models/LATEST."""
+        self.model = tail_model.TwoStageTailModel.load(model_path)
         self.meta = self.model.meta
         self.feature_names = self.model.feature_names
         self.u = self.model.u
@@ -71,9 +72,11 @@ def main():
     ap.add_argument("--date", type=str, default=None, help="factor date t (loss is on day t+1)")
     ap.add_argument("--csv", type=str, default=None,
                     help="CSV with the 13 factor columns (default: artifacts/dataset.csv)")
+    ap.add_argument("--model", type=str, default=None, help="model JSON or directory (default: models/LATEST)")
     args = ap.parse_args()
 
-    p = GPDPredictor()
+    p = GPDPredictor(args.model)
+    print(f"Model version: {p.model.version}")
     df = pd.read_csv(args.csv or ARTIFACT_DIR / "dataset.csv")
     if args.ticker:
         df = df[df["ticker"] == args.ticker.upper()]

@@ -3,5 +3,6 @@ pandas
 requests
 python-dotenv
 scikit-learn
-tensorflow
+scipy
+matplotlib
 pyarrow

@@ -28,7 +28,8 @@ Part 3 -- two-stage model on ALL validation stock-days (artifacts/two_stage_vali
     (c) VaR99 breach rate per p_u decile: two-stage model vs a constant 10% instead of p_u(x)
     (d) the Part 1 stock over the validation period: daily loss vs its VaR99, breaches marked
 
-Model and formulas come from tail_model.py (numpy; no torch needed).
+Model: the version named in models/LATEST (or --model PATH); formulas from tail_model.py.
+Data: artifacts/dataset.csv (features.py). Figures are saved to artifacts/.
 
 Run:
     .venv/bin/python evaluate_tail.py                         # biggest validation loss
@@ -104,16 +105,16 @@ def row_params(row):
 # 1. Load model + data, predict mixture parameters
 # ==========================================
 
-def load_everything():
-    """Model (both stages, tail_model.TwoStageTailModel) + dataset with loss columns."""
-    meta_path = ARTIFACT_DIR / "preprocess.json"
+def load_everything(model_path=None):
+    """Model version (models/LATEST by default, tail_model.TwoStageTailModel) + dataset with loss columns."""
     data_path = ARTIFACT_DIR / "dataset.csv"
-    for p in (meta_path, data_path, ARTIFACT_DIR / "gpd_model.pt", ARTIFACT_DIR / "pu_model.pt"):
-        if not p.exists():
-            raise SystemExit(f"Missing {p}. Run `TQT research machine learning part.py` first.")
-
-    meta = json.loads(meta_path.read_text())
-    model = tail_model.TwoStageTailModel.from_artifacts(ARTIFACT_DIR)
+    if not data_path.exists():
+        raise SystemExit(f"Missing {data_path}. Build it with features.py first.")
+    model = tail_model.TwoStageTailModel.load(model_path)
+    if not model.has_pu:
+        raise SystemExit("this model version has no exceedance network (p_u)")
+    meta = model.meta                        # inference fields + info (split date, results, ...)
+    print(f"Model version: {model.version}")
 
     df = pd.read_csv(data_path, parse_dates=["date"])
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
@@ -503,9 +504,10 @@ def main():
                         help="factor date t (YYYY-MM-DD); the loss is on the next trading day")
     parser.add_argument("--list", action="store_true", help="print the 15 largest validation losses")
     parser.add_argument("--no-show", action="store_true", help="save PNGs without opening windows")
+    parser.add_argument("--model", default=None, help="model JSON or directory (default: models/LATEST)")
     args = parser.parse_args()
 
-    meta, model, pu_model, tm, df = load_everything()
+    meta, model, pu_model, tm, df = load_everything(args.model)
     u = float(meta["threshold_u_loss"])
 
     val_all = predict_params(model, meta, df[df["is_val"]], pu_model)       # every validation row

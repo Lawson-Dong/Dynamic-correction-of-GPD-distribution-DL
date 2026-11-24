@@ -13,10 +13,9 @@ The three shared files are the SAME files the training code uses -- one implemen
 factors, the forward pass and the allocation rule for the whole project.
 
 How to run
-  1. Locally: train ("TQT research machine learning part.py" writes quantconnect/gpd_mixture_model.json)
-     or re-export with  python export_model_for_qc.py --artifacts ../artifacts
-  2. QuantConnect -> Object Store: upload gpd_mixture_model.json (key MODEL_KEY below)
-     and, optionally, qc_sec_factors.csv (key SEC_KEY)
+  1. Model: the file named in models/LATEST (e.g. models/2026-11-21_two-stage_wide-heavy.json).
+  2. QuantConnect -> Object Store: upload that file under the key MODEL_KEY below
+     and, optionally, qc_sec_factors.csv under SEC_KEY
   3. New Python project: main.py = this file, plus three more files copied unchanged from the
      repository root: factor_core.py, tail_model.py, strategy_core.py. Edit CONFIG, run a backtest.
 """
@@ -41,7 +40,7 @@ START_DATE = (2025, 1, 1)
 END_DATE = (2026, 10, 30)
 CASH = 1_000_000
 
-MODEL_KEY = "gpd_mixture_model.json"   # Object Store key of the exported model
+MODEL_KEY = "gpd_mixture_model.json"   # Object Store key under which the models/ JSON was uploaded
 SEC_KEY = "qc_sec_factors.csv"         # Object Store key of n_8k_30d / filing_change (qc_sec_factors.py)
 
 MODE = "gpd"            # "gpd" = this strategy; "equal" / "inverse_vol" = benchmarks on the same stocks
@@ -130,16 +129,16 @@ class GPDMixtureTailRiskAlgorithm(QCAlgorithm):
         self.vix = self.add_data(CBOE, "VIX", Resolution.DAILY).symbol
 
         if not self.object_store.contains_key(MODEL_KEY):
-            raise ValueError(f"Object Store key '{MODEL_KEY}' not found. Upload the file written by "
-                             f"export_model_for_qc.py first.")
+            raise ValueError(f"Object Store key '{MODEL_KEY}' not found. Upload the model file named in "
+                             f"models/LATEST under this key first.")
         self.model = TwoStageTailModel.from_json(self.object_store.read(MODEL_KEY))
         if not 0 <= self.model.u < D_LOSS:
             raise ValueError(f"need 0 <= u < d, got u={self.model.u}, d={D_LOSS}")
-        self.log(f"model loaded: u = {self.model.u:.4f}, pi_min = {self.model.pi_min}, "
+        self.log(f"model {self.model.version} loaded: u = {self.model.u:.4f}, pi_min = {self.model.pi_min}, "
                  f"p_u network: {self.model.has_pu}, features = {self.model.feature_names}")
         if USE_PU and not self.model.has_pu:
-            raise ValueError("USE_PU = True but the model file has no exceedance network; re-export "
-                             "it with export_model_for_qc.py (needs pu_model.pt) or set USE_PU = False")
+            raise ValueError("USE_PU = True but this model version has no exceedance network; "
+                             "upload a version with a p_u network or set USE_PU = False")
         if list(self.model.feature_names) != FEATURE_NAMES:
             raise ValueError("model feature order differs from factor_core.FEATURE_NAMES")
         missing = [n for n in self.model.feature_names
