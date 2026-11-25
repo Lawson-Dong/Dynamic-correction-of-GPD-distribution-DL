@@ -24,6 +24,9 @@ m.version, m.info["description"], m.info["results"]["validation"]
 | 版本 | 说明 | 验证集（2023-03-30 起） |
 |---|---|---|
 | `2026-11-21_two-stage_wide-heavy` | 两段模型：p_u 网络 + 门控 GPD 混合模型（gate_bn32，π_min 0.01，θ_β 初值 1.85，lr 3e-4），13 个因子；训练数据 2016-03 至 2023-03 | GPD NLL −3.1203；S<1% 0.89%，S<2.5% 2.12%；p_u AUC 0.711；无条件 VaR99 超出率 0.83% |
+| `2026-11-24_two-stage_monotone` | 架构、13 个输入、输出格式都与上一版相同，只换了权重：GPD 部分训练时加了单调性惩罚（vol、downside vol、range、VIX、worst252、e63、echo_q、kurtosis 一起上升时，条件尾部风险不下降），p_u 网络重新训练（numpy）；训练数据同上 | GPD NLL −3.1174；S<1% 1.07%，S<2.5% 2.51%；p_u AUC 0.711；VaR99 超出率 0.80%；R 分十组校准误差 0.34（上一版 0.54）；单调性违反 0.0%（上一版 49%） |
+
+`LATEST` 目前仍指向 `2026-11-21_two-stage_wide-heavy`。要改用新版本，把 `LATEST` 的内容改成 `2026-11-24_two-stage_monotone.json`，或者直接 `TwoStageTailModel.load("models/2026-11-24_two-stage_monotone.json")`。
 
 ## 新增一个版本
 
